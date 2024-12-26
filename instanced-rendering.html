@@ -1,0 +1,940 @@
+<html>
+    <head>
+        <title>Instanced Rendering - WebGL</title>
+        <style>
+            body {
+                background-color: black;
+                margin: 0;
+                padding: 0;
+                position: relative;
+            }
+            #main {
+                display: flex;
+                height: 100%;
+                justify-content: center;
+                align-items: center;
+            }
+            canvas {
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <section id="main">
+            <canvas id="canvas" height="1024" width="1024"></canvas>
+        </section>
+    </body>
+    <script src="lib/dat.gui.js"></script>
+    <script src="lib/gl-matrix.js"></script>
+    <script src="assets/mei.obj.js"></script>
+    <script>
+
+
+    const { glMatrix } = window;
+
+    const TEXTURE_NONE = -1;
+    const TEXTURE_POLKA_DOT = 0;
+    const TEXTURE_CHECKERBOARD = 1;
+    const TEXTURE_POLKA_DOT_STRIPES = 2;
+    const TEXTURE_STRIPES_VERTICAL = 3;
+    const TEXTURE_STRIPES_HORIZONTAL = 4;
+
+    const TEXTURE_OPTIONS = [
+        { name: 'No Texture', enum: TEXTURE_NONE },
+        { name: 'Polka Dots', enum: TEXTURE_POLKA_DOT },
+        { name: 'Checkerboard', enum: TEXTURE_CHECKERBOARD },
+        { name: 'Polka Dot Stripes', enum: TEXTURE_POLKA_DOT_STRIPES },
+        { name: 'Stripes (Vertical)', enum: TEXTURE_STRIPES_VERTICAL },
+        { name: 'Stripes (Horizontal)', enum: TEXTURE_STRIPES_HORIZONTAL },
+    ];
+
+    const SHADER_NAME = 'shader';
+
+    const SHADER =  {
+        vertex: `#version 300 es
+            precision highp float;
+            uniform mat4 u_model_matrix;
+            uniform mat4 u_view_matrix;
+            uniform mat4 u_projection_matrix;
+            uniform float u_time;
+            uniform float u_sphere_rho;
+            uniform bool u_animate_rotation;
+            uniform bool u_animate_camera;
+            uniform bool u_invert_falloff;
+
+            in vec3 a_position;
+            in vec2 a_uv;
+            in vec3 a_normal;
+            in vec3 a_instance_translation;
+            in vec3 a_instance_rotation;
+
+            out vec3 v_position;
+            out vec2 v_world_uv;
+            out vec3 v_normal;
+            out vec3 v_world_normal;
+            out vec3 v_camera_position;
+            out float v_falloff;
+
+            void rotX(inout mat4 r, float angle) {
+                r[1][1] = cos(angle);
+                r[1][2] = sin(angle);
+                r[2][1] = -sin(angle);
+                r[2][2] = cos(angle);
+            }
+
+            void rotY(inout mat4 r, float angle) {
+                r[0][0] = cos(angle);
+                r[0][2] = sin(angle);
+                r[2][0] = -sin(angle);
+                r[2][2] = cos(angle);
+            }
+
+            void rotZ(inout mat4 r, float angle) {
+                r[0][0] = cos(angle);
+                r[0][1] = sin(angle);
+                r[1][0] = -sin(angle);
+                r[1][1] = cos(angle);
+            }
+
+            void main(void) {
+                vec3 instance_translation = a_instance_translation * u_sphere_rho;
+
+                // This but for R4:
+                // https://en.wikipedia.org/wiki/Rotation_matrix#Basic_rotations
+                mat4 rotationX = mat4(1.);
+                mat4 rotationY = mat4(1.);
+                mat4 rotationZ = mat4(1.);
+
+                if (u_animate_rotation) {
+                    // Rotate based on time.
+                    // rotX(rotationX, u_time);
+                    // rotY(rotationY, u_time);
+                    // rotZ(rotationZ, u_time);
+
+                    // Every figure is on the sphere, pointing outward, but also animating.
+                    rotX(rotationX, a_instance_rotation.x * u_time);
+                    rotY(rotationY, -a_instance_rotation.y * u_time);
+                    rotZ(rotationZ, a_instance_rotation.z * u_time);
+                } else {
+                    // Awesome start shape with all negated.
+                    // rotX(rotationX, -a_instance_rotation.x);
+                    // rotY(rotationY, -a_instance_rotation.y);
+                    // rotZ(rotationZ, -a_instance_rotation.z);
+
+                    // Every figure is on the sphere, pointing outward.
+                    rotX(rotationX, a_instance_rotation.x);
+                    rotY(rotationY, -a_instance_rotation.y);
+                    rotZ(rotationZ, a_instance_rotation.z);
+                }
+
+                mat4 rotation = rotationZ * rotationY * rotationX;
+
+                // Row-major
+                mat4 translation = mat4(1.);
+                translation[3].xyz = instance_translation;
+
+                // We reuse this quite a bit so do it once:
+                mat4 VMTR = u_view_matrix * u_model_matrix * translation * rotation;
+                if (u_animate_camera) {
+                    rotX(rotationX, u_time);
+                    rotY(rotationY, u_time);
+                    rotZ(rotationZ, u_time);
+                    mat4 camera_rotation = rotationZ * rotationY * rotationX;
+                    VMTR = u_view_matrix * u_model_matrix * camera_rotation * translation * rotation;
+                }
+
+                // Need to apply these transformations for the per-fragment lighting to work.
+                // Specifically for Phong, we need to do things in the eye-space (i.e. view * model)
+                // https://www.lighthouse3d.com/tutorials/glsl-12-tutorial/the-normal-matrix/
+                v_position = (VMTR * vec4(a_position, 1.)).xyz;
+                v_world_uv = a_uv;
+
+                vec4 normal = vec4(a_normal, 0.);
+                v_normal = (VMTR * normal).xyz;
+                v_world_normal = (u_model_matrix * normal).xyz;
+
+                // The camera's position is just a translation in the viewMatrix, so we can pick it off the bottom
+                // row since it's column major. Since we're moving everything away from the camera, we need to
+                // negate it too.
+                v_camera_position = (u_view_matrix * -(u_view_matrix[3])).xyz;
+
+                // The positions are normalized, but we can dampen this.
+                v_falloff = length(a_position) * 0.75;
+                if (u_invert_falloff) {
+                    v_falloff = 1. - v_falloff;
+                }
+
+                // Applying rotation then moving it around with the translation.
+                // If we want to do things uniformly, switch that order.
+                gl_Position = u_projection_matrix * VMTR * vec4(a_position, 1.);
+            }
+        `,
+        fragment: `#version 300 es
+            precision highp float;
+            uniform vec3 u_colour;
+            uniform float u_opacity;
+            uniform bool u_debug_normals;
+            uniform int u_use_texture;
+
+            in vec3 v_position;
+            in vec2 v_world_uv;
+            in vec3 v_normal;
+            in vec3 v_world_normal;
+            in vec3 v_camera_position;
+            in float v_falloff;
+
+            out vec4 colour;
+
+            struct Light {
+                vec3 position;
+                float intensity;
+            };
+
+            Light LIGHTS[] = Light[](
+                // top left
+                Light(vec3(-1., 5., 0.), 0.85)
+                // bottom right back
+                // Light(vec3(2., -2., 2.), 0.1)
+                // front right or left
+                // Light(vec3(-2., 0., 6), 0.1)
+            );
+
+            vec3 polka_dots(vec2 point) {
+                // mx and my are now some value between 0 and size.
+                float size = 0.2;
+                float half_size = size * 0.5;
+                vec2 modPoint = mod(point, size);
+
+                // Shift to centre of the quadrant, since it's been divided into 4
+                vec2 centre = vec2(half_size);
+                float d = distance(centre, modPoint);
+
+                // controls how big the circles will be
+                float radius = half_size * 0.5;
+                if (radius < d) {
+                    return vec3(1.);
+                }
+
+                // Smoothes the intersection between the polkadot and the returned background
+                // because we slowly blendly between white and red as we apporach the radius
+                // boundary.
+                float stepped = 1. - smoothstep(0.2, 0.3, abs(radius - d) / radius);
+                return vec3(1., stepped, stepped);
+            }
+
+            vec3 striped_polka_dots(vec2 point) {
+                // mx and my are now some value between 0 and size.
+                float size = 0.2;
+                float half_size = size * 0.5;
+                vec2 modPoint = mod(point, size);
+
+                // Shift to centre of the quadrant, since it's been divided into 4
+                vec2 centre = vec2(half_size);
+                float d = distance(centre, modPoint);
+
+                // controls how big the circles will be
+                float radius = half_size * 0.5;
+
+                // controls the stripe staggering.
+                // we take double the size because the circle occupies this entire row.
+                // if we're above half the doubled size, we're technically on another row.
+                float colour = mod(point.y, size * 2.0) > size ? 1. : 0.;
+
+                if (radius < d) {
+                    return vec3(1. - colour);
+                }
+                return vec3(colour);
+            }
+
+            vec3 checkerboard(vec2 point) {
+                // mx and my are now some value between 0 and size.
+                float size = 0.2;
+                float half_size = size * 0.5;
+                float mx = mod(point.x, size);
+                float my = mod(point.y, size);
+
+                // tracking even/odd rows lets us stagger the colour like a proper checkerboard
+                // without doing this, we get stripes.
+                // even rows
+                // if it's > half_size, choose an even row, otherwise use an odd row.
+                float colour = my > half_size ? 1. : 0.;
+
+                if (mx > half_size) {
+                    return vec3(1. - colour);
+                }
+                return vec3(colour);
+            }
+
+            vec3 stripes(vec2 point, int direction) {
+                // 0 for horizontal, 1 for vertical.
+                // mx and my are now some value between 0 and size.
+                float size = 0.05;
+                float half_size = size * 0.5;
+                float mx = mod(point.x, size);
+                float my = mod(point.y, size);
+
+                // tracking even/odd rows lets us stagger the colour like a proper checkerboard
+                // without doing this, we get stripes.
+                // even rows
+                // if it's > half_size, choose an even row, otherwise use an odd row.
+
+                if ((mx > half_size && direction == 0) ||  (my > half_size && direction == 1)) {
+                    return vec3(1.);
+                }
+
+                return vec3(0.);
+            }
+
+            vec3 get_texture(vec3 base_colour) {
+                // Just scale the point up if we want more repetition from the texture.
+                float scale = 4.;
+
+                // Use this to 'scroll' the texture over the shape, since it will keep
+                // using rotated values to sample from the boxmap.
+                // vec2 uv = v_uv * scale;
+                vec2 uv = v_world_uv * scale;
+                vec3 colour = base_colour;
+
+                switch (u_use_texture) {
+                    case ${TEXTURE_POLKA_DOT}:
+                        colour = polka_dots(uv);
+                        break;
+                    case ${TEXTURE_CHECKERBOARD}:
+                        colour = checkerboard(uv);
+                        break;
+                    case ${TEXTURE_POLKA_DOT_STRIPES}:
+                        colour = striped_polka_dots(uv);
+                        break;
+                    case ${TEXTURE_STRIPES_VERTICAL}:
+                        colour = stripes(uv, 1);
+                        break;
+                    case ${TEXTURE_STRIPES_HORIZONTAL}:
+                        colour = stripes(uv, 0);
+                        break;
+                }
+
+                return colour;
+            }
+
+            vec3 lighting(vec3 base_colour) {
+                vec3 colour = vec3(0.);
+
+                // Always work in unit vector space for this kind of stuff.
+                vec3 normal = normalize(v_normal);
+
+                for (int i = 0; i < LIGHTS.length(); i++) {
+                    Light light = LIGHTS[i];
+                    vec3 light_to_vertex = normalize(light.position - v_position);
+                    
+                    // https://www.cs.toronto.edu/~jacobson/phong-demo/
+                    // Lambert's cosine law
+                    float lambertian = max(dot(normal, light_to_vertex), 0.0);
+                    float specular = 0.0;
+                    float shininess_value = 512.;
+                    if (lambertian > 0.0) {
+                        // Reflected light vector
+                        vec3 reflection = reflect(-light_to_vertex, normal);
+                        // Vector to viewer
+                        vec3 vector_to_camera = normalize(v_camera_position - v_position);
+                        // Compute the specular term
+                        float specular_angle = max(dot(reflection, vector_to_camera), 0.0);
+                        specular = pow(specular_angle, shininess_value);
+                    }
+
+                    float Kd = light.intensity;
+                    float Ka = 0.05;
+                    float Ks = light.intensity;
+
+                    vec3 working_colour = base_colour;
+                    if (u_use_texture >= 0) {
+                        working_colour = get_texture(base_colour);
+
+                    }
+                    vec3 ambient_colour = working_colour.xyz;
+                    vec3 specular_colour = working_colour;
+
+                    colour += vec3(
+                        Ka * ambient_colour +
+                        Kd * lambertian * working_colour +
+                        Ks * specular * specular_colour
+                    );
+                }
+
+                return colour;
+            }
+
+            void main(void) {
+                colour = vec4(u_colour, u_opacity);
+
+                vec3 base_colour = u_colour;
+
+                if (u_debug_normals) {
+                    // Test the model normals.
+                    base_colour = normalize(abs(v_world_normal));
+
+                    // A way to calculate per-face normals if needed.
+                    base_colour = normalize(cross(dFdx(v_position), dFdy(v_position)));
+                }
+
+                colour.xyz = lighting(base_colour);
+
+                // falloff factor.
+                colour.xyz *= v_falloff;
+            }
+        `,
+        uniforms: [
+            'u_model_matrix',
+            'u_view_matrix',
+            'u_projection_matrix',
+            'u_colour',
+            'u_opacity',
+            'u_time',
+            'u_debug_normals',
+            'u_use_texture',
+            'u_texture',
+            'u_sphere_rho',
+            'u_animate_rotation',
+            'u_animate_camera',
+            'u_invert_falloff',
+        ],
+        attributes: [
+            'a_position',
+            'a_uv',
+            'a_normal',
+            'a_instance_translation',
+            'a_instance_rotation',
+        ],
+    };
+
+    async function loadImage(imageData) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = imageData;
+        });
+    }
+
+    class Shader {
+        constructor(gl, vertCode, fragCode) {
+            this.program = null;
+            this.setupShader(gl, vertCode, fragCode);
+        }
+
+        setupShader(gl, vertCode, fragCode) {
+            const log = (shader) => {
+                const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                if (!compiled) {
+                    console.log('Shader compiled failed: ' + compiled);
+                
+                    const compilationLog = gl.getShaderInfoLog(shader);
+                    console.log('Shader compiler log: ' + compilationLog);
+                }
+            };
+
+            const vertShader = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vertShader, vertCode);
+            gl.compileShader(vertShader);
+            log(vertShader);
+            
+        
+            const fragShader = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(fragShader, fragCode); 
+            gl.compileShader(fragShader);
+            log(fragShader);
+            
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertShader);
+            gl.attachShader(shaderProgram, fragShader);
+            gl.linkProgram(shaderProgram);
+
+            this.program = shaderProgram
+        }
+
+        cacheUniformLocations(gl, uniformNames) {
+            uniformNames.forEach(name => {
+                const key = `${name}Location`;
+                this[key] = gl.getUniformLocation(this.program, name);
+            });
+        }
+
+        cacheAttributeLocations(gl, attributeNames) {
+            attributeNames.forEach(name => {
+                const key = `${name}Location`;
+                const location = gl.getAttribLocation(this.program, name);
+                this[key] = location;
+            });
+        }
+
+        debugAttributes(gl) {
+            const { program } = this;
+            const numAttribs = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES);
+                for (let i = 0; i < numAttribs; ++i) {
+                const info = gl.getActiveAttrib(program, i);
+                console.log('name:', info.name, 'type:', info.type, 'size:', info.size);
+            }
+        }
+    }
+
+    class Mesh {
+        static Identifiers = {
+            Vert: 'v',
+            Texture: 'vt',
+            Normal: 'vn',
+            GroupName: 'g',
+            SmoothGroup: 's',
+            Face: 'f',
+        };
+
+        static KnownIdentifiers = new Set(
+            Object.keys(Mesh.Identifiers).reduce((a, key) => {
+                a.push(Mesh.Identifiers[key]);
+                return a;
+            }, [])
+        );
+
+        constructor(obj) {
+            // Rendering data.
+            this.colour = [1, 1, 1];
+            this.opacity = 1;
+            this.useTexture = TEXTURE_POLKA_DOT;
+            this.debugNormals = false;
+
+            this.obj = {
+                index: 0,
+                // Inputs from the obj.
+                vertsIn: [],
+                uvsIn: [],
+                normalsIn: [],
+                // Outputs to render.
+                pointIndices: {},
+                verts: [],
+                uvs: [],
+                normals: [],
+                indices: [],
+            };
+
+            // Populates this.obj based on an input 'obj' file.
+            const lines = obj.split(/[\r\n]+/);
+            this.parse(lines);
+
+            this.gl = {
+                positions: {
+                    data: new Float32Array(this.obj.verts),
+                    buffer: null,
+                },
+                uvs: {
+                    data: new Float32Array(this.obj.uvs),
+                    buffer: null,
+                },
+                normals: {
+                    data: new Float32Array(this.obj.normals),
+                    buffer: null,
+                },
+                indices: {
+                    data: new Uint32Array(this.obj.indices),
+                    buffer: null,
+                },
+            };
+
+            this.textures = {
+                diffuse: null,
+                normal: null,
+            };
+        }
+
+        getVec2(tokens) {
+            return [
+                parseFloat(tokens[0]),
+                parseFloat(tokens[1]),
+            ];
+        }
+
+        getVec3(tokens) {
+            const vec = this.getVec2(tokens);
+            vec.push(parseFloat(tokens[2]));
+            return vec;
+        }
+
+        getPoint(token) {
+            // each token is a potential set of v/vt/vn indices.
+            return token.split(/\//).map(v => parseInt(v));
+        }
+
+        parse(lines) {
+            for (let i = 0; i < lines.length; i++) {
+                const tokens = lines[i].split(/\s+/);
+
+                if (0 === tokens.length) {
+                    continue;
+                }
+
+                const identifier = tokens.shift();
+
+                if (!Mesh.KnownIdentifiers.has(identifier)) {
+                    continue;
+                }
+
+                switch (identifier) {
+                    case Mesh.Identifiers.Vert:
+                        this.obj.vertsIn.push(this.getVec3(tokens));
+                        break;
+                    case Mesh.Identifiers.Texture:
+                        this.obj.uvsIn.push(this.getVec2(tokens));
+                        break;
+                    case Mesh.Identifiers.Normal:
+                        this.obj.normalsIn.push(this.getVec3(tokens));
+                        break;
+                    case Mesh.Identifiers.GroupName:
+                        console.log(`Mesh name ${tokens.shift()}`);
+                        break;
+                    case Mesh.Identifiers.SmoothGroup:
+                        break;
+                    case Mesh.Identifiers.Face:
+                        this.handleFace(tokens);
+                        break;
+                }
+            }
+        }
+
+        handleFace(tokens) {
+            // if the vert, normal, and uv all match
+            // for the given face (e.g. 1/1/1 means use
+            // vert 1, uv 1, normal 1) and we see it a second
+            // time in the data, then we can share the index.
+
+            for (let j = 0; j < tokens.length; j++) {
+                // each point on the face
+                const token = tokens[j];
+                const existingIndex = this.obj.pointIndices[token];
+
+                if (!existingIndex) {
+                    // we've never seen this combination of data
+                    // for the point before, so it's new and we must
+                    // add it to our outputs and also increment the
+                    // index.
+                    this.obj.pointIndices[token] = this.obj.index;
+                    this.obj.index++;
+
+                    const point = this.getPoint(token);
+                    // the point is referencing a line, there are 3 values
+                    // on the line for verts so all three should be pushed.
+                    // this also applies for normals. with uvs it's only 2.
+                    // also, the obj is 1-indexed so we need to subtract 1.
+                    point[0] && this.obj.verts.push(...this.obj.vertsIn[point[0] - 1])
+                    point[1] && this.obj.uvs.push(...this.obj.uvsIn[point[1] - 1]);
+                    point[2] && this.obj.normals.push(...this.obj.normalsIn[point[2] - 1]);
+                }
+
+                // we've already seen this combination of data
+                // which is why we just need to push the index
+                // without adding new output data.
+                this.obj.indices.push(this.obj.pointIndices[token]);
+            }
+        }
+        
+        setupGL(viz) {
+            const { ctx: gl } = viz;
+            const { [SHADER_NAME]: shader } = viz.state;
+            const { program } = shader;
+
+            viz.setupBuffer(this.gl.positions);
+            viz.setupBuffer(this.gl.uvs);
+            viz.setupBuffer(this.gl.normals);
+            viz.setupBuffer(this.gl.indices, 'ELEMENT_ARRAY_BUFFER');
+
+            // All of these are normalized.
+
+            // Positions
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.positions.buffer);
+            gl.vertexAttribPointer(shader.a_positionLocation, 3, gl.FLOAT, true, 12, 0);
+            gl.enableVertexAttribArray(shader.a_positionLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            // UVs
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.uvs.buffer);
+            gl.vertexAttribPointer(shader.a_uvLocation, 2, gl.FLOAT, true, 8, 0);
+            gl.enableVertexAttribArray(shader.a_uvLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+            // Normals
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.gl.normals.buffer);
+            gl.vertexAttribPointer(shader.a_normalLocation, 3, gl.FLOAT, true, 12, 0);
+            gl.enableVertexAttribArray(shader.a_normalLocation);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+    }
+
+    class Viz {
+        constructor() {
+            this.canvas = document.getElementById('canvas');
+            this.ctx = this.canvas.getContext('webgl2', {
+                alpha: true,
+                antialias: true,
+                depth: true,
+                premultipliedAlpha: false,
+            });
+            this.state = {
+                instanceCount: 64,
+                instancing: {},
+                animateRotation: false,
+                animateCamera: false,
+                sphereRho: 1,
+                scale: 1,
+                invertFalloff: false,
+            };
+            this.cameraPosition = {
+                x: 0,
+                y: 0,
+                z: 7,
+            };
+            this.setupMatrices();
+            this.setupGL();
+        }
+
+        setupMatrices = () => {
+            const { mat4, vec3 } = glMatrix;
+            // const { x: sx, y: sy, z: sz } = this.state.scale;
+            this.modelMatrix = mat4.create();
+            mat4.scale(this.modelMatrix, this.modelMatrix, [this.state.scale, this.state.scale, this.state.scale]);
+
+            this.viewMatrix = mat4.create();
+            // viewer centre, view direction, up
+            const { x, y, z } = this.cameraPosition;
+            mat4.lookAt(this.viewMatrix, vec3.fromValues(x, y, z), vec3.fromValues(0, 0, -1), vec3.fromValues(0, 1, 0));
+
+            this.projectionMatrix = mat4.create();
+            mat4.perspective(this.projectionMatrix, Math.PI / 3, 1, 1 / 1024, 1024);
+        }
+
+        setupGL() {
+            const { ctx: gl } = this;
+
+            gl.enable(gl.BLEND);
+            // Needed for alpha and depth testing.
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+            gl.depthRange(1 / 1024, 1024);
+
+            gl.depthMask(true);
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+            this.setupShaders();
+            this.setupInstancing();
+        }
+
+        async setupTexture(imageData) {
+            const img = await loadImage(imageData);
+
+            const { ctx: gl } = this;
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            // Both the textures need y-flipping for webgl on unpack
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA,
+                img.width,
+                img.height,
+                0,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                img,
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            return texture;
+        }
+
+        setupShaders() {
+            const { ctx: gl } = this;
+
+            const { vertex, fragment, uniforms, attributes } = SHADER;
+            this.state[SHADER_NAME] = new Shader(gl, vertex, fragment);
+            this.state[SHADER_NAME].cacheUniformLocations(gl, uniforms);
+            this.state[SHADER_NAME].cacheAttributeLocations(gl, attributes);
+
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;
+            gl.useProgram(program);
+        }
+
+        setupBuffer(obj, type = 'ARRAY_BUFFER') {
+            const { ctx: gl } = this;
+
+            const bufferType = gl[type];
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(bufferType, buffer);
+            gl.bufferData(bufferType, obj.data, gl.STATIC_DRAW);
+            obj.buffer = buffer;
+        }
+
+        setupInstancing = () => {
+            const count = this.state.instanceCount;
+            // Optimization:
+            // Only store x, z positions. We can add y in the shader?
+            const translations = [];
+
+            // TODO
+            // We could take this 3D and maybe put the person on a bunch of spherical coordinates.
+            // Columns
+
+            // Sphere layout using spherical coordinates. Puts it all at a constant rho from
+            // the centre, though we could vary it randomly if we wanted to fake displacement.
+            // Doesn't account for orientation.
+            const length = Math.sqrt(count);
+            // Rho of 0 is cool because it causes all of them to animate out from a central point.
+            const start = -Math.PI;
+            const end = Math.PI;
+            const thetaStep = (Math.PI * 2) / length;
+            const phiStep = Math.PI / length;
+            // -pi <= theta <= pi
+            for (let theta = start; theta < end; theta += thetaStep) {
+                // phiStep <= phi <= pi
+                // Skip the first one because it just results in bunching around the pole.
+                for (let phi = phiStep; phi < end; phi += phiStep) {
+                    // There is an implicit rho of 1 here, but we can set it programmatically.
+                    const x = Math.sin(phi) * Math.sin(theta);
+                    // y is up in this case.
+                    const y = Math.cos(phi);
+                    const z = Math.sin(phi) * Math.cos(theta);
+                    translations.push(x, y, z);
+                    const xRot = phi;
+                    // Swapping y and z is cool.
+                    const yRot = theta;
+                    const zRot = 0;
+                    translations.push(xRot, yRot, zRot);
+                }
+            }
+
+            this.state.instancing.data = new Float32Array(translations);
+            this.setupBuffer(this.state.instancing);
+
+            const { ctx: gl } = this;
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;
+
+            // Translations per instance
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.state.instancing.buffer);
+            gl.vertexAttribPointer(shader.a_instance_translationLocation, 3, gl.FLOAT, false, 24, 0);
+            gl.enableVertexAttribArray(shader.a_instance_translationLocation);
+            // Only step forward in this once per instance.
+            gl.vertexAttribDivisor(shader.a_instance_translationLocation, 1);
+
+            gl.vertexAttribPointer(shader.a_instance_rotationLocation, 3, gl.FLOAT, false, 24, 12);
+            gl.enableVertexAttribArray(shader.a_instance_rotationLocation);
+            // Only step forward in this once per instance.
+            gl.vertexAttribDivisor(shader.a_instance_rotationLocation, 1);
+            gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        }
+
+        clear() {
+            const { ctx: gl } = this;
+
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        }
+
+        draw(obj, timestamp = 0) {
+            // Draw to offscreen render buffers.
+            const { ctx: gl } = this;
+            const { opacity, colour, useTexture, debugNormals } = obj;
+            const { [SHADER_NAME]: shader } = this.state;
+            const { program } = shader;
+
+            // TODO
+            // Use a UBO.
+            gl.uniform1f(shader.u_timeLocation, timestamp);
+
+            gl.uniform3fv(shader.u_colourLocation, colour);
+            gl.uniform1f(shader.u_opacityLocation, opacity);
+            gl.uniform1i(shader.u_use_textureLocation, useTexture);
+            gl.uniform1i(shader.u_debug_normalsLocation, debugNormals);
+            gl.uniform1f(shader.u_sphere_rhoLocation, this.state.sphereRho);
+            gl.uniform1i(shader.u_animate_rotationLocation, this.state.animateRotation);
+            gl.uniform1i(shader.u_animate_cameraLocation, this.state.animateCamera);
+            gl.uniform1i(shader.u_invert_falloffLocation, this.state.invertFalloff);
+
+            gl.uniformMatrix4fv(shader.u_model_matrixLocation, false, this.modelMatrix);
+            gl.uniformMatrix4fv(shader.u_view_matrixLocation, false, this.viewMatrix);
+            gl.uniformMatrix4fv(shader.u_projection_matrixLocation, false, this.projectionMatrix);
+
+            // Indices
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.gl.indices.buffer);
+            // / 6 because we're storing translation and position for each instance which is 6 values.
+            gl.drawElementsInstanced(gl.TRIANGLES, obj.gl.indices.data.length, gl.UNSIGNED_INT, 0, this.state.instancing.data.length / 6);
+            // gl.drawElements(gl.TRIANGLES, obj.gl.indices.data.length, gl.UNSIGNED_INT, 0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+        }
+
+    }
+
+    function setupControls(mesh, viz) {
+        const gui = new dat.GUI();
+        gui.width = gui.width * 1.5;
+
+        const folderViz = gui.addFolder('Visualization');
+        folderViz.open();
+        {
+            const max = 100;
+            const min = -max;
+
+            const props = ['x', 'y', 'z'];
+            props.forEach(p => {
+                const ctl = folderViz.add(viz.cameraPosition, p, min, max, 0.1);
+                ctl.name(`Camera ${p}`);
+                ctl.onChange(viz.setupMatrices);
+            });
+        }
+        {
+            const ctl = folderViz.add(viz.state, 'instanceCount', 0, 900, 1);
+            ctl.name("Instance Count");
+            ctl.onChange(viz.setupInstancing);
+        }
+        {
+            const ctl = folderViz.add(viz.state, 'scale', 0, 10, 0.001);
+            ctl.name("Instance Scale");
+            ctl.onChange(viz.setupMatrices);
+        }
+        folderViz.add(viz.state, 'sphereRho', 0, 10, 0.01).name("Sphere Radius");
+        folderViz.add(viz.state, 'animateRotation').name("Animate Rotation");
+        folderViz.add(viz.state, 'animateCamera').name("Animate Camera");
+        folderViz.add(viz.state, 'invertFalloff').name("Invert Falloff");
+
+        const folderMesh = gui.addFolder('Mesh');
+        folderMesh.open();
+        folderMesh.add(
+            mesh,
+            'useTexture',
+            TEXTURE_OPTIONS.reduce((acc, o) => ({ ...acc, [o.name]: o.enum }), {}
+        )).name('Use Texture');
+        folderMesh.add(mesh, 'debugNormals').name('Normal Colour');
+        folderMesh.add(mesh, 'opacity', 0, 1, 0.01);
+    }
+
+    async function main() {
+        const { width, height } = document.getElementById('canvas');
+        const viz = new Viz();
+        // const mesh = new Mesh(window._assets.scifiBox.obj);
+        const mesh = new Mesh(window._assets.mei.obj);
+        mesh.setupGL(viz);
+        setupControls(mesh, viz);
+
+        const update = (timestamp) => {
+            const time = timestamp * 0.0003;
+            viz.clear();
+            viz.draw(mesh, time);
+            window.requestAnimationFrame(update);
+        }
+
+        window.requestAnimationFrame(update);
+    }
+
+    main();
+    </script>
+</html>
